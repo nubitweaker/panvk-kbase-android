@@ -95,6 +95,29 @@ jobs:
           ./scripts/fetch-mesa.sh
           ./scripts/apply-patches.sh --profile "$PROFILE"
 
+      - name: Fix patch 226 (it uses gs_bo_pool, which this profile does not have)
+        run: |
+          set -eux
+          python3 - <<'EOF'
+          import pathlib
+          base = pathlib.Path("work/mesa/src/panfrost/vulkan")
+          c = base / "panvk_cmd_pool.c"
+          h = base / "panvk_cmd_pool.h"
+          src, hdr = c.read_text(), h.read_text()
+          if "gs_bo_pool" in src and "gs_bo_pool" not in hdr:
+              n = src.count("gs_bo_pool")
+              src = src.replace("#define PANVK_CMD_POOL_BO_POOLS 6", "#define PANVK_CMD_POOL_BO_POOLS 5")
+              src = src.replace("   out[3] = &pool->gs_bo_pool;\n", "")
+              src = src.replace("out[4] = &pool->tls_bo_pool;", "out[3] = &pool->tls_bo_pool;")
+              src = src.replace("out[5] = &pool->tls_big_bo_pool;", "out[4] = &pool->tls_big_bo_pool;")
+              assert "gs_bo_pool" not in src, "unexpected extra uses of gs_bo_pool"
+              c.write_text(src)
+              print("fixed", n, "use(s) of gs_bo_pool")
+          else:
+              print("no fix needed")
+          EOF
+          grep -n "BO_POOLS\|out\[" work/mesa/src/panfrost/vulkan/panvk_cmd_pool.c | head -20
+
       - name: Build the Android driver
         env:
           PANVK_KBASE_RELEASE: ${{ inputs.label }}-${{ github.run_number }}
