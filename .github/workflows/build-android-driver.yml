@@ -47,7 +47,7 @@ jobs:
             libdrm-dev zlib1g-dev libexpat1-dev libzstd-dev libelf-dev libudev-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxshmfence-dev libxcb-randr0-dev \
             libxcb-dri3-dev libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev \
-            libxcb-xfixes0-dev spirv-tools libspirv-tools-dev spirv-headers
+            libxcb-xfixes0-dev spirv-tools spirv-headers
           # Meson 1.4 or newer is required; the Ubuntu package is older.
           python3 -m pip install --user --break-system-packages "meson>=1.4.0" mako packaging pyyaml
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
