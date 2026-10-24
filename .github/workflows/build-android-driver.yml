@@ -60,8 +60,24 @@ jobs:
           sudo ./llvm.sh "$LLVM_VER"
           sudo apt-get install -y --no-install-recommends \
             clang-$LLVM_VER llvm-$LLVM_VER-dev libclang-$LLVM_VER-dev libclang-cpp$LLVM_VER-dev \
-            libclc-$LLVM_VER-dev libllvmspirvlib-$LLVM_VER-dev llvm-spirv-$LLVM_VER
+            libclc-$LLVM_VER-dev cmake
           echo "/usr/lib/llvm-$LLVM_VER/bin" >> "$GITHUB_PATH"
+
+      - name: Build SPIRV-LLVM-Translator ${{ env.LLVM_VER }} (not packaged for Ubuntu 24.04)
+        run: |
+          set -eux
+          git clone --depth 1 -b "llvm_release_${LLVM_VER}0" https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git "$RUNNER_TEMP/spirv-llvm-translator"
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$RUNNER_TEMP/spirv-headers"
+          cmake -S "$RUNNER_TEMP/spirv-llvm-translator" -B "$RUNNER_TEMP/spirv-llvm-translator/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DLLVM_DIR="/usr/lib/llvm-$LLVM_VER/lib/cmake/llvm" \
+            -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$RUNNER_TEMP/spirv-headers" \
+            -DLLVM_INCLUDE_TESTS=OFF
+          ninja -C "$RUNNER_TEMP/spirv-llvm-translator/build"
+          sudo ninja -C "$RUNNER_TEMP/spirv-llvm-translator/build" install
+          sudo ldconfig
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/share/pkgconfig" >> "$GITHUB_ENV"
+          pkg-config --modversion LLVMSPIRVLib || PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig pkg-config --modversion LLVMSPIRVLib
 
       - name: Show tool versions
         run: |
