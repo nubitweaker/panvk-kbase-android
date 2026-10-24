@@ -1,0 +1,152 @@
+name: build-android-driver
+
+# Builds libvulkan_panfrost.so (Android / bionic, arm64) from the pinned Mesa commit plus
+# this repository's patch series, then packs a zip Eden can install as a custom driver.
+# Run it by hand: Actions tab -> build-android-driver -> Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile (profiles/*.json)"
+        default: "g615-v11-csf"
+      api:
+        description: "Android API level of the build (29 loads on Android 10 and newer)"
+        default: "29"
+      label:
+        description: "Short name shown in the driver info line (letters, digits, dash only)"
+        default: "Nubi-Eden"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      LLVM_VER: "21"
+      PROFILE: ${{ inputs.profile }}
+      API: ${{ inputs.api }}
+      LABEL: ${{ inputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+
+      - name: Install build tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache ninja-build pkg-config python3-pip python3-mako python3-packaging \
+            python3-yaml python3-ply glslang-tools flex bison zip unzip wget gnupg \
+            software-properties-common lsb-release binutils file \
+            libdrm-dev zlib1g-dev libexpat1-dev libzstd-dev libelf-dev libudev-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxshmfence-dev libxcb-randr0-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev \
+            libxcb-xfixes0-dev spirv-tools libspirv-tools-dev spirv-headers
+          # Meson 1.4 or newer is required; the Ubuntu package is older.
+          python3 -m pip install --user --break-system-packages "meson>=1.4.0" mako packaging pyyaml
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM ${{ env.LLVM_VER }} (host tools need it)
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VER"
+          sudo apt-get install -y --no-install-recommends \
+            clang-$LLVM_VER llvm-$LLVM_VER-dev libclang-$LLVM_VER-dev libclang-cpp$LLVM_VER-dev \
+            libclc-$LLVM_VER-dev libllvmspirvlib-$LLVM_VER-dev llvm-spirv-$LLVM_VER
+          echo "/usr/lib/llvm-$LLVM_VER/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          set -x
+          meson --version
+          ninja --version
+          glslangValidator --version | head -n 2
+          llvm-config-$LLVM_VER --version
+          echo "NDK=$ANDROID_NDK_LATEST_HOME"
+          cat "$ANDROID_NDK_LATEST_HOME/source.properties" || true
+
+      - name: Fetch pinned Mesa and apply patches
+        run: |
+          set -eux
+          ./scripts/fetch-mesa.sh
+          ./scripts/apply-patches.sh --profile "$PROFILE"
+
+      - name: Build the Android driver
+        env:
+          PANVK_KBASE_RELEASE: ${{ inputs.label }}-${{ github.run_number }}
+          PANVK_JOBS: "4"
+        run: |
+          set -eux
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+          export PATH="$NDK_BIN:$PATH"
+          ./scripts/build-android.sh --profile "$PROFILE" --api "$API" --ndk "$ANDROID_NDK_LATEST_HOME"
+
+      - name: Check the binary is a real Android driver
+        run: |
+          set -eux
+          ./scripts/validate-binary.sh --abi android "dist/android-$PROFILE/libvulkan_panfrost.so"
+          sha256sum "dist/android-$PROFILE/libvulkan_panfrost.so"
+
+      - name: Pack the zip for Eden
+        run: |
+          set -eux
+          OUT="out/${LABEL}"
+          mkdir -p "$OUT"
+          cp "dist/android-$PROFILE/libvulkan_panfrost.so" "$OUT/"
+          MESA_SHA="$(python3 -c "import json;print(json.load(open('sources.lock'))['mesaCommit'])")"
+          python3 - "$OUT" "$MESA_SHA" <<'EOF'
+          import json, os, sys, hashlib
+          out, mesa = sys.argv[1], sys.argv[2]
+          label = os.environ["LABEL"]
+          run = os.environ["GITHUB_RUN_NUMBER"]
+          api = int(os.environ["API"])
+          sha = hashlib.sha256(open(os.path.join(out, "libvulkan_panfrost.so"), "rb").read()).hexdigest()
+          meta = {
+              "schemaVersion": 1,
+              "name": f"{label} (build {run})",
+              "description": "Custom build of panvk-kbase-android for Mali-G615, patches from this fork.",
+              "author": "panvk-kbase-android patches, built by " + os.environ["GITHUB_REPOSITORY_OWNER"],
+              "packageVersion": f"build-{run}",
+              "vendor": "Mesa",
+              "driverVersion": "Mesa 26.3.0-devel",
+              "minApi": api,
+              "libraryName": "libvulkan_panfrost.so",
+          }
+          json.dump(meta, open(os.path.join(out, "meta.json"), "w"), indent=2)
+          source = {
+              "mesaCommit": mesa,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "repositoryCommit": os.environ["GITHUB_SHA"],
+              "workflowRun": run,
+              "libvulkan_panfrost.so sha256": sha,
+          }
+          json.dump(source, open(os.path.join(out, "SOURCE.json"), "w"), indent=2)
+          EOF
+          (cd "$OUT" && sha256sum libvulkan_panfrost.so > SHA256SUMS.txt && zip -q "../${LABEL}.zip" meta.json libvulkan_panfrost.so SOURCE.json SHA256SUMS.txt)
+          unzip -l "out/${LABEL}.zip"
+
+      - name: Upload the driver zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.label }}-zip
+          path: out/${{ inputs.label }}.zip
+          if-no-files-found: error
+
+      - name: Upload build logs (also when the build fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/*.log
+            build/**/meson-logs/meson-log.txt
+          if-no-files-found: ignore
