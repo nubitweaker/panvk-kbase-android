@@ -1,1 +1,215 @@
+name: Build Eden G615 A-B test (P5R)
 
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Choose baseline or the memory-risk experimental no-autotrim build"
+        required: true
+        type: choice
+        default: baseline
+        options:
+          - baseline
+          - cmdpool-noautotrim
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      LLVM_VER: "21"
+      PROFILE: g615-v11-csf
+      API: "29"
+      VARIANT: ${{ inputs.variant }}
+      LABEL: Nubi-Eden-P5R
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache ninja-build pkg-config python3-pip python3-mako python3-packaging \
+            python3-yaml python3-ply glslang-tools flex bison zip unzip wget gnupg \
+            software-properties-common lsb-release binutils file \
+            libdrm-dev zlib1g-dev libexpat1-dev libzstd-dev libelf-dev libudev-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxshmfence-dev libxcb-randr0-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-shm0-dev libxcb-sync-dev \
+            libxcb-xfixes0-dev spirv-tools spirv-headers
+          python3 -m pip install --user --break-system-packages \
+            "meson>=1.4.0" mako packaging pyyaml
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM ${{ env.LLVM_VER }}
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VER"
+          sudo apt-get install -y --no-install-recommends \
+            clang-$LLVM_VER llvm-$LLVM_VER-dev libclang-$LLVM_VER-dev \
+            libclang-cpp$LLVM_VER-dev libclc-$LLVM_VER-dev cmake
+          echo "/usr/lib/llvm-$LLVM_VER/bin" >> "$GITHUB_PATH"
+
+      - name: Build SPIRV-LLVM-Translator
+        run: |
+          set -eux
+          git clone --depth 1 -b "llvm_release_${LLVM_VER}0" \
+            https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git \
+            "$RUNNER_TEMP/spirv-llvm-translator"
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git \
+            "$RUNNER_TEMP/spirv-headers"
+          cmake -S "$RUNNER_TEMP/spirv-llvm-translator" \
+            -B "$RUNNER_TEMP/spirv-llvm-translator/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DLLVM_DIR="/usr/lib/llvm-$LLVM_VER/lib/cmake/llvm" \
+            -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$RUNNER_TEMP/spirv-headers" \
+            -DLLVM_INCLUDE_TESTS=OFF
+          ninja -C "$RUNNER_TEMP/spirv-llvm-translator/build"
+          sudo ninja -C "$RUNNER_TEMP/spirv-llvm-translator/build" install
+          sudo ldconfig
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/share/pkgconfig" >> "$GITHUB_ENV"
+          pkg-config --modversion LLVMSPIRVLib
+
+      - name: Show tool versions
+        run: |
+          set -eux
+          meson --version
+          ninja --version
+          llvm-config-$LLVM_VER --version
+          echo "NDK=$ANDROID_NDK_LATEST_HOME"
+          cat "$ANDROID_NDK_LATEST_HOME/source.properties"
+
+      - name: Fetch pinned Mesa and apply G615 patches
+        run: |
+          set -eux
+          ./scripts/fetch-mesa.sh
+          ./scripts/apply-patches.sh --profile "$PROFILE"
+
+      - name: Apply the Nubi patch-226 profile fix
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import pathlib
+          base = pathlib.Path("work/mesa/src/panfrost/vulkan")
+          c = base / "panvk_cmd_pool.c"
+          h = base / "panvk_cmd_pool.h"
+          src, hdr = c.read_text(), h.read_text()
+          if "gs_bo_pool" in src and "gs_bo_pool" not in hdr:
+              n = src.count("gs_bo_pool")
+              src = src.replace("#define PANVK_CMD_POOL_BO_POOLS 6", "#define PANVK_CMD_POOL_BO_POOLS 5")
+              src = src.replace("   out[3] = &pool->gs_bo_pool;\n", "")
+              src = src.replace("out[4] = &pool->tls_bo_pool;", "out[3] = &pool->tls_bo_pool;")
+              src = src.replace("out[5] = &pool->tls_big_bo_pool;", "out[4] = &pool->tls_big_bo_pool;")
+              assert "gs_bo_pool" not in src, "unexpected gs_bo_pool references"
+              c.write_text(src)
+              print("fixed", n, "gs_bo_pool reference(s)")
+          else:
+              print("no patch-226 fix needed")
+          PY
+
+      - name: Apply optional command-pool experiment
+        if: inputs.variant == 'cmdpool-noautotrim'
+        run: |
+          set -eux
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("work/mesa/src/panfrost/vulkan/panvk_cmd_pool.c")
+          src = p.read_text()
+          old = 'v = debug_get_bool_option("PANVK_CMD_POOL_AUTOTRIM", true);'
+          new = 'v = debug_get_bool_option("PANVK_CMD_POOL_AUTOTRIM", false);'
+          assert src.count(old) == 1, "expected exactly one auto-trim default"
+          p.write_text(src.replace(old, new, 1))
+          print("Experimental build: command-pool auto-trim defaults off")
+          PY
+
+      - name: Build Android driver
+        env:
+          PANVK_KBASE_RELEASE: Nubi-Eden-P5R-${{ inputs.variant }}-${{ github.run_number }}
+          PANVK_JOBS: "4"
+        run: |
+          set -eux
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+          export PATH="$NDK_BIN:$PATH"
+          ./scripts/build-android.sh --profile "$PROFILE" --api "$API" \
+            --ndk "$ANDROID_NDK_LATEST_HOME"
+
+      - name: Validate Android ABI and Vulkan ICD exports
+        run: |
+          set -eux
+          ./scripts/validate-binary.sh --abi android \
+            "dist/android-$PROFILE/libvulkan_panfrost.so"
+          sha256sum "dist/android-$PROFILE/libvulkan_panfrost.so"
+
+      - name: Package Eden driver ZIP
+        run: |
+          set -eux
+          OUT="out/${LABEL}-${VARIANT}"
+          mkdir -p "$OUT"
+          cp "dist/android-$PROFILE/libvulkan_panfrost.so" "$OUT/"
+          MESA_SHA="$(python3 -c "import json;print(json.load(open('sources.lock'))['mesaCommit'])")"
+          python3 - "$OUT" "$MESA_SHA" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          out, mesa = sys.argv[1:]
+          label, variant = os.environ["LABEL"], os.environ["VARIANT"]
+          sha = hashlib.sha256((pathlib.Path(out) / "libvulkan_panfrost.so").read_bytes()).hexdigest()
+          if variant == "cmdpool-noautotrim":
+              description = ("EXPERIMENTAL Eden/Mali-G615 build: command-pool auto-trim defaults off. "
+                             "May retain more memory and worsen memory pressure; no P5R FPS guarantee.")
+              local_patch = "PANVK_CMD_POOL_AUTOTRIM default false; experimental, device A/B required"
+          else:
+              description = ("Baseline Nubi PanVK Kbase build for Mali-G615 in Eden-compatible ZIP format. "
+                             "Not validated for Persona 5 Royal; no FPS guarantee.")
+              local_patch = "none; repository patch series only"
+          meta = {
+              "schemaVersion": 1,
+              "name": f"{label}-{variant}",
+              "description": description,
+              "author": "panvk-kbase-android workflow build",
+              "packageVersion": f"run-{os.environ['GITHUB_RUN_NUMBER']}-{variant}",
+              "vendor": "Mesa",
+              "driverVersion": "Mesa 26.3.0-devel",
+              "minApi": int(os.environ["API"]),
+              "libraryName": "libvulkan_panfrost.so",
+          }
+          source = {
+              "mesaCommit": mesa,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "repositoryCommit": os.environ["GITHUB_SHA"],
+              "workflowRun": os.environ["GITHUB_RUN_NUMBER"],
+              "variant": variant,
+              "localPatch": local_patch,
+              "libvulkan_panfrost.so sha256": sha,
+          }
+          (pathlib.Path(out) / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+          (pathlib.Path(out) / "SOURCE.json").write_text(json.dumps(source, indent=2) + "\n")
+          PY
+          (cd "$OUT" && sha256sum libvulkan_panfrost.so > SHA256SUMS.txt && \
+            zip -q "../${LABEL}-${VARIANT}.zip" meta.json libvulkan_panfrost.so SOURCE.json SHA256SUMS.txt)
+          unzip -l "out/${LABEL}-${VARIANT}.zip"
+
+      - name: Upload installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nubi-Eden-P5R-${{ inputs.variant }}-run-${{ github.run_number }}
+          path: out/Nubi-Eden-P5R-${{ inputs.variant }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            build/*.log
+            build/**/meson-logs/meson-log.txt
+          if-no-files-found: ignore
+          retention-days: 14
